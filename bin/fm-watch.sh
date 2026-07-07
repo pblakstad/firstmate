@@ -451,14 +451,15 @@ EOF
     # will not re-fire, log, and keep blocking without enqueuing. The provably-working
     # check is the only costly one (it may run a bounded no-mistakes call), so the ||
     # ordering evaluates it ONLY for a non-afk, no-captain-verb signal.
-    # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
     auto_decision="none|not checked"
+    # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
     if ! afk_present && ! signal_reason_is_actionable $files; then
       # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
       auto_decision=$(auto_nudge_signal_decision "$STATE" $files)
     fi
     auto_action=${auto_decision%%|*}
     auto_detail=${auto_decision#*|}
+    # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
     if [ "$auto_action" = self ] || [ "$auto_action" = safe ]; then
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
@@ -467,7 +468,6 @@ EOF
 $pending
 EOF
       triage_log "absorbed $reason ($auto_detail)"
-    # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
     elif afk_present || signal_reason_is_actionable $files || [ "$auto_action" = escalate ] || ! signal_crew_provably_working $files; then
       if [ "$auto_action" = escalate ]; then
         reason="$reason ($auto_detail)"
