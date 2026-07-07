@@ -64,6 +64,18 @@ shell_quote() {
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
 
+# Operator house rules injected into every brief (ship, scout, secondmate), so a
+# crewmate on any harness is told to honor the operator's standing global agent
+# instructions, not just whatever its own harness happens to auto-load.
+# Kept generic: it points at ~/AGENTS.md "if that file exists", so a fleet with no
+# such file is a silent no-op while this operator's rules are always enforced.
+HOUSE_RULES=$(cat <<'RULES'
+# Operator house rules
+The operator keeps standing global agent instructions at `~/AGENTS.md`.
+If that file exists, read it and comply with every rule in it for all work you produce here, on top of whatever your own harness already enforces.
+RULES
+)
+
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
 idx=1
@@ -114,6 +126,8 @@ Use this only for material phase changes, a captain decision, a real blocker, a 
 This is also how you return the answer to a marked from-firstmate request above.
 Routine internal supervision, heartbeats, retries, and crewmate churn stay inside your own home and must not touch that status file.
 
+$HOUSE_RULES
+
 # Definition of done
 You are persistent by default. Do not exit just because your queue is empty.
 On startup and restart, run normal firstmate bootstrap and recovery through \`bin/fm-session-start.sh\` for your own home, but only to RECONCILE work that is already yours: in-flight crewmates, tracked backlog items, and durable watches recorded in this home.
@@ -157,6 +171,8 @@ The report is the only thing that survives, so anything worth keeping must be in
 5. If you hit the same obstacle twice, append \`blocked: {why}\` and stop; firstmate will help.
 6. If a decision belongs to a human (product choices, destructive actions),
    append \`needs-decision: {summary of options}\` and stop. Firstmate will reply with the decision.
+
+$HOUSE_RULES
 
 # Definition of done
 Write your findings to \`$DATA/$ID/report.md\`.
@@ -261,6 +277,8 @@ Record only project knowledge useful to almost every future session.
 For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
 If you touch a project \`AGENTS.md\` that lacks \`## Maintaining this file\`, add that short self-governance section from \`$FM_ROOT/bin/fm-ensure-agents-md.sh\` in the same pass.
 Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
+
+$HOUSE_RULES
 
 $DOD
 EOF
