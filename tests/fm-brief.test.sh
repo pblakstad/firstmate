@@ -93,7 +93,42 @@ test_ship_project_memory_wording() {
   pass "fm-brief.sh: ship project-memory wording carries the AGENTS.md authoring bar"
 }
 
+# Every brief - ship (all modes), scout, and secondmate charter - must carry the
+# operator house-rules block so a crewmate on any harness is told to read and
+# follow ~/AGENTS.md, not just whatever its own harness happens to auto-load.
+test_house_rules_in_every_brief() {
+  local home id proj brief
+  home="$TMP_ROOT/house-rules-home"
+  write_registry "$home"
+
+  # Ship briefs, one per delivery mode.
+  for id_proj in "hr-ship-nm:no-registry-proj" "hr-ship-dp:direct-proj" "hr-ship-lo:local-proj"; do
+    id=${id_proj%%:*}
+    proj=${id_proj##*:}
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" "$proj" >/dev/null 2>&1
+    brief="$home/data/$id/brief.md"
+    assert_grep "Operator house rules" "$brief" "$id: ship brief missing operator house-rules block"
+    assert_grep "~/AGENTS.md" "$brief" "$id: ship brief missing the ~/AGENTS.md reference"
+  done
+
+  # Scout brief.
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" hr-scout some-proj --scout >/dev/null 2>&1
+  brief="$home/data/hr-scout/brief.md"
+  assert_grep "Operator house rules" "$brief" "scout brief missing operator house-rules block"
+  assert_grep "~/AGENTS.md" "$brief" "scout brief missing the ~/AGENTS.md reference"
+
+  # Secondmate charter.
+  FM_SECONDMATE_CHARTER="triage fixture" FM_HOME="$home" \
+    "$ROOT/bin/fm-brief.sh" hr-sm --secondmate some-proj >/dev/null 2>&1
+  brief="$home/data/hr-sm/brief.md"
+  assert_grep "Operator house rules" "$brief" "secondmate charter missing operator house-rules block"
+  assert_grep "~/AGENTS.md" "$brief" "secondmate charter missing the ~/AGENTS.md reference"
+
+  pass "fm-brief.sh: every brief carries the operator house-rules block"
+}
+
 test_script_parses
 test_ship_modes_generate_clean_briefs
 test_no_mistakes_dod_wording
 test_ship_project_memory_wording
+test_house_rules_in_every_brief
