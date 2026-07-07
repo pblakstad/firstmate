@@ -287,6 +287,42 @@ test_auto_nudge_counter_giveup_and_progress_reset() {
   pass "auto-nudge counter gives up after the configured limit and resets on pane progress"
 }
 
+test_auto_nudge_signal_stale_oscillation_holds_bounds() {
+  local dir state fakebin sent window key decision
+  dir=$(make_case auto-nudge-oscillation); state="$dir/state"; fakebin="$dir/fakebin"; sent="$dir/send.log"
+  install_fake_fm_send "$fakebin" "$sent"
+  window="test:fm-osc"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  fm_write_meta "$state/osc.meta" "window=$window" "kind=ship" "harness=opencode"
+  printf 'working: implementing\n' > "$state/osc.status"
+  printf 'frozen-pane\n' > "$state/.hash-$key"
+  : > "$state/osc.turn-ended"
+  export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake idle'
+
+  # Alternate the two wake paths on an otherwise UNCHANGED task (same status stat,
+  # same pane hash). The give-up counter must climb monotonically across the
+  # signal<->stale switches and never reset, so exactly FM_MAX_AUTO_NUDGES nudges
+  # go out before escalation - the oscillation-reset regression would leak extra
+  # nudges and never converge.
+  decision=$(FM_STATE_OVERRIDE="$state" FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent" \
+    FM_MAX_AUTO_NUDGES=2 FM_AUTO_NUDGE_INTERVAL_SECS=0 auto_nudge_signal_decision "$state" "$state/osc.turn-ended")
+  case "$decision" in self\|*) ;; *) fail "signal wake did not auto-nudge on first sight: $decision" ;; esac
+  [ "$(cat "$state/.auto-nudges-osc" 2>/dev/null)" = 1 ] || fail "counter not 1 after first (signal) nudge: $(cat "$state/.auto-nudges-osc" 2>/dev/null)"
+
+  decision=$(FM_STATE_OVERRIDE="$state" FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent" \
+    FM_MAX_AUTO_NUDGES=2 FM_AUTO_NUDGE_INTERVAL_SECS=0 auto_nudge_stale_decision "$window" "$state")
+  case "$decision" in self\|auto-nudged*) ;; *) fail "stale wake reset the counter or did not nudge after a signal nudge: $decision" ;; esac
+  [ "$(cat "$state/.auto-nudges-osc" 2>/dev/null)" = 2 ] || fail "oscillation reset the counter instead of climbing to 2: $(cat "$state/.auto-nudges-osc" 2>/dev/null)"
+
+  decision=$(FM_STATE_OVERRIDE="$state" FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent" \
+    FM_MAX_AUTO_NUDGES=2 FM_AUTO_NUDGE_INTERVAL_SECS=0 auto_nudge_signal_decision "$state" "$state/osc.turn-ended")
+  case "$decision" in escalate\|*demand-inspection*) ;; *) fail "counter did not give up and escalate after the bound across wake types: $decision" ;; esac
+  [ "$(line_count "$sent")" = 2 ] || fail "oscillation leaked extra nudges past FM_MAX_AUTO_NUDGES: $(cat "$sent")"
+  unset FM_CREW_STATE_BIN FM_FAKE_CREW_STATE
+  pass "auto-nudge bounds hold across signal<->stale oscillation (no counter reset on wake-type switch)"
+}
+
 # --- benign wakes are absorbed ONLY when the crew is provably working ---------
 
 test_provably_working_signal_absorbed() {
@@ -843,6 +879,7 @@ test_signal_crew_provably_working_classifier
 test_auto_nudge_idle_opencode_signal_absorbed_once
 test_auto_nudge_never_for_busy_terminal_or_secondmate
 test_auto_nudge_counter_giveup_and_progress_reset
+test_auto_nudge_signal_stale_oscillation_holds_bounds
 test_provably_working_signal_absorbed
 test_turn_ended_provably_working_absorbed
 test_turn_ended_not_working_surfaced
