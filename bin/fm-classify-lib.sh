@@ -20,6 +20,14 @@
 # it is still working. Callers run it ONLY on no-verb signal handling and first
 # sighting of a stale hash, never on every wake, so the per-wake triage stays
 # cheap.
+#
+# Auto-nudge watchdog knobs:
+#   FM_MAX_AUTO_NUDGES          consecutive opencode nudges before giving up
+#                               and surfacing for inspection (default 3)
+#   FM_AUTO_NUDGE_INTERVAL_SECS minimum seconds between nudges for the same
+#                               unchanged task-progress signature (default 60)
+#   FM_AUTO_NUDGE_MESSAGE       generic continuation steer sent by fm-send
+#   FM_SEND_BIN                 fm-send.sh path override for tests
 
 # Directory of this library, used to locate the sibling fm-crew-state.sh reader.
 # Resolved at source time from BASH_SOURCE so it works whether sourced by a
@@ -30,6 +38,7 @@ _FM_CLASSIFY_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null)"
 # Overridable so tests can stub the run-step/pane verdict without a real worktree
 # or no-mistakes install; absent, it points at the real sibling script.
 FM_CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-crew-state.sh}"
+FM_SEND_BIN="${FM_SEND_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-send.sh}"
 
 # Captain-relevant status verbs. A status line carrying any of these is work
 # firstmate must see. Lines without these verbs are no-verb signals: the watcher
@@ -37,6 +46,14 @@ FM_CREW_STATE_BIN="${FM_CREW_STATE_BIN:-$_FM_CLASSIFY_LIB_DIR/fm-crew-state.sh}"
 # its away-mode classification. FM_CAPTAIN_RE overrides the whole set when a home
 # needs a custom verb vocabulary; absent, this default applies.
 FM_CLASSIFY_CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|checks green|ready in branch|merged'
+
+_classify_stat_sig() {
+  if [ "$(uname)" = Darwin ]; then
+    stat -f '%z:%Fm' "$1" 2>/dev/null
+  else
+    stat -c '%s:%Y' "$1" 2>/dev/null
+  fi
+}
 
 # Return the last non-blank line of a status file (empty if missing/blank).
 last_status_line() {
@@ -122,6 +139,198 @@ crew_is_provably_working() {  # <id>
     run-step|pane) return 0 ;;
     *)             return 1 ;;
   esac
+}
+
+_auto_nudge_key() { printf '%s' "$1" | tr ':/.' '___'; }
+
+_auto_nudge_meta_value() {  # <meta> <key>
+  grep "^$2=" "$1" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+
+_auto_nudge_num() {  # <value> <default>
+  case "$1" in
+    ''|*[!0-9]*) printf '%s' "$2" ;;
+    *)           printf '%s' "$1" ;;
+  esac
+}
+
+# Pane hash for a task, resolved through its recorded window/terminal target.
+# Empty when no window is recorded yet or no pane hash has been captured.
+_auto_nudge_pane_sig_for_task() {  # <task> <state>
+  local task=$1 state=$2 win key
+  win=$(_auto_nudge_meta_value "$state/$task.meta" window)
+  [ -n "$win" ] || win=$(_auto_nudge_meta_value "$state/$task.meta" terminal)
+  [ -n "$win" ] || return 0
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  cat "$state/.hash-$key" 2>/dev/null || true
+}
+
+# Progress signature for a task: the actual task-progress signals only - the
+# status-file stat plus the current pane hash when available. It deliberately
+# carries NO wake-path token, so a signal-to-stale or stale-to-signal
+# oscillation on an otherwise unchanged task keeps a single signature lineage
+# and the FM_MAX_AUTO_NUDGES / FM_AUTO_NUDGE_INTERVAL_SECS bounds hold across
+# wake-type transitions rather than resetting on each switch.
+auto_nudge_progress_for_task() {  # <task> <state>
+  local task=$1 state=$2 status_sig pane_sig
+  status_sig=$(_classify_stat_sig "$state/$task.status" 2>/dev/null || true)
+  pane_sig=$(_auto_nudge_pane_sig_for_task "$task" "$state")
+  printf 'status=%s pane=%s' "$status_sig" "$pane_sig"
+}
+
+# Extract the status= or pane= field from a "status=<v> pane=<v>" signature.
+# Neither field's value contains a space (a stat sig or a hex hash), so a simple
+# split on " pane=" is unambiguous.
+_auto_nudge_sig_field() {  # <signature> status|pane
+  local sig=$1
+  case "$2" in
+    status) sig=${sig#status=}; printf '%s' "${sig%% pane=*}" ;;
+    pane)   printf '%s' "${sig##* pane=}" ;;
+  esac
+}
+
+# 0 if the current progress signature shows GENUINE task progress over the
+# previous one: a changed status-file stat, or a changed pane hash where BOTH
+# readings are non-empty. A pane hash merely appearing or disappearing (the
+# signal path reads it before the stale scan has captured it) is a change in
+# measurement availability, NOT progress, so it must not reset the counter -
+# that is what kept a signal/stale oscillation from double-nudging. A first-ever
+# signature (no previous) is not progress either; the counter simply starts.
+_auto_nudge_progress_advanced() {  # <previous-sig> <current-sig>
+  local prev=$1 cur=$2 ps cs pp cp
+  [ -n "$prev" ] || return 1
+  ps=$(_auto_nudge_sig_field "$prev" status); cs=$(_auto_nudge_sig_field "$cur" status)
+  [ "$ps" != "$cs" ] && return 0
+  pp=$(_auto_nudge_sig_field "$prev" pane); cp=$(_auto_nudge_sig_field "$cur" pane)
+  [ -n "$pp" ] && [ -n "$cp" ] && [ "$pp" != "$cp" ] && return 0
+  return 1
+}
+
+auto_nudge_task_decision() {  # <task> <state> <progress-signature>
+  local task=$1 state=$2 progress_sig=$3 meta harness kind last line crew_state src key
+  local count_file sig_file at_file escalated_file previous_sig canonical_sig eff_pane count max interval now last_at target msg send_out
+  [ -n "$task" ] || { printf 'none|auto-nudge skipped: no task'; return 0; }
+  meta="$state/$task.meta"
+  [ -f "$meta" ] || { printf 'none|auto-nudge skipped for %s: missing metadata' "$task"; return 0; }
+  harness=$(_auto_nudge_meta_value "$meta" harness)
+  kind=$(_auto_nudge_meta_value "$meta" kind)
+  [ -n "$kind" ] || kind=ship
+  [ "$kind" = secondmate ] && { printf 'none|auto-nudge skipped for %s: secondmate' "$task"; return 0; }
+  [ "$harness" = opencode ] || { printf 'none|auto-nudge skipped for %s: harness=%s' "$task" "${harness:-unknown}"; return 0; }
+
+  last=$(last_status_line "$state/$task.status")
+  if [ -n "$last" ] && status_is_captain_relevant "$last"; then
+    printf 'none|auto-nudge skipped for %s: terminal status' "$task"
+    return 0
+  fi
+
+  key=$(_auto_nudge_key "$task")
+  count_file="$state/.auto-nudges-$key"
+  sig_file="$state/.auto-nudge-progress-$key"
+  at_file="$state/.auto-nudge-at-$key"
+  escalated_file="$state/.auto-nudge-escalated-$key"
+  previous_sig=$(cat "$sig_file" 2>/dev/null || true)
+  # Persist a signature that never loses a known pane hash: if this reading has no
+  # pane hash (the signal path ran before the stale scan captured one), keep the
+  # previously-known one so its later reappearance does not look like progress.
+  eff_pane=$(_auto_nudge_sig_field "$progress_sig" pane)
+  [ -n "$eff_pane" ] || eff_pane=$(_auto_nudge_sig_field "$previous_sig" pane)
+  canonical_sig="status=$(_auto_nudge_sig_field "$progress_sig" status) pane=$eff_pane"
+  if _auto_nudge_progress_advanced "$previous_sig" "$canonical_sig"; then
+    rm -f "$count_file" "$at_file" "$escalated_file" 2>/dev/null || true
+  fi
+  printf '%s' "$canonical_sig" > "$sig_file"
+  # Already gave up at this same (unchanged) progress signature: nothing has
+  # advanced since, so short-circuit BEFORE the bounded crew-state read rather
+  # than re-running that read every poll for a stuck-and-escalated crew.
+  if [ "$(cat "$escalated_file" 2>/dev/null || true)" = "$canonical_sig" ]; then
+    printf 'self|auto-nudge already escalated for %s at this progress signature' "$task"
+    return 0
+  fi
+
+  line=$("$FM_CREW_STATE_BIN" "$task" 2>/dev/null) || true
+  case "$line" in state:*) ;; *) line="state: unknown · source: none · unreadable crew state" ;; esac
+  crew_state=${line#state: }; crew_state=${crew_state%% *}
+  src=${line#*source: }; src=${src%% *}
+  if [ "$crew_state" = working ]; then
+    case "$src" in
+      run-step|pane)
+        printf 'safe|auto-nudge skipped for %s: provably working' "$task"
+        return 0
+        ;;
+    esac
+  fi
+  case "$crew_state" in
+    parked|done|blocked|failed)
+      printf 'none|auto-nudge skipped for %s: current state %s' "$task" "$crew_state"
+      return 0
+      ;;
+  esac
+
+  max=$(_auto_nudge_num "${FM_MAX_AUTO_NUDGES:-}" 3)
+  interval=$(_auto_nudge_num "${FM_AUTO_NUDGE_INTERVAL_SECS:-}" 60)
+  count=$(cat "$count_file" 2>/dev/null || echo 0)
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  if [ "$count" -ge "$max" ]; then
+    printf '%s' "$canonical_sig" > "$escalated_file"
+    printf 'escalate|auto-nudge give-up for %s: %s consecutive nudges with no progress, demand-inspection' "$task" "$count"
+    return 0
+  fi
+
+  now=$(date +%s)
+  last_at=$(cat "$at_file" 2>/dev/null || echo 0)
+  case "$last_at" in ''|*[!0-9]*) last_at=0 ;; esac
+  if [ "$count" -gt 0 ] && [ "$interval" -gt 0 ] && [ $((now - last_at)) -lt "$interval" ]; then
+    printf 'self|auto-nudge waiting for %s: last nudge %ss ago' "$task" "$((now - last_at))"
+    return 0
+  fi
+
+  target="fm-$task"
+  msg=${FM_AUTO_NUDGE_MESSAGE:-"continue - do not yield your turn until the task is committed and the PR is open, or you hit a real blocker"}
+  if ! send_out=$("$FM_SEND_BIN" "$target" "$msg" 2>&1); then
+    printf 'escalate|auto-nudge send failed for %s: %s' "$task" "$send_out"
+    return 0
+  fi
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$count_file"
+  printf '%s\n' "$now" > "$at_file"
+  printf '%s' "$canonical_sig" > "$sig_file"
+  rm -f "$escalated_file" 2>/dev/null || true
+  printf 'self|auto-nudged %s (%s/%s)' "$task" "$count" "$max"
+}
+
+auto_nudge_signal_decision() {  # <state> <file> ...
+  local state=$1 f base task seen="" decision action detail any_self=0
+  shift || true
+  for f in "$@"; do
+    base=${f##*/}
+    case "$base" in
+      *.status)     task=${base%.status} ;;
+      *.turn-ended) task=${base%.turn-ended} ;;
+      *)            continue ;;
+    esac
+    [ -n "$task" ] || continue
+    case " $seen " in *" $task "*) continue ;; esac
+    seen="$seen $task"
+    decision=$(auto_nudge_task_decision "$task" "$state" "$(auto_nudge_progress_for_task "$task" "$state")")
+    action=${decision%%|*}
+    detail=${decision#*|}
+    case "$action" in
+      self) any_self=1 ;;
+      safe) ;;
+      escalate) printf 'escalate|%s' "$detail"; return 0 ;;
+      *) printf 'none|%s' "$detail"; return 0 ;;
+    esac
+  done
+  [ -n "$seen" ] || { printf 'none|auto-nudge skipped: no signal task'; return 0; }
+  [ "$any_self" = 1 ] && { printf 'self|auto-nudge handled signal for:%s' "$seen"; return 0; }
+  printf 'safe|auto-nudge skipped: all signal crews are provably working'
+}
+
+auto_nudge_stale_decision() {  # <window> <state>
+  local win=$1 state=$2 task
+  task=$(window_to_task "$win" "$state")
+  auto_nudge_task_decision "$task" "$state" "$(auto_nudge_progress_for_task "$task" "$state")"
 }
 
 # 0 (benign/absorb) if EVERY task referenced by a no-verb "signal:" wake is provably

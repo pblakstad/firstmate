@@ -44,6 +44,9 @@
 #     Buffered escalation delivery also has a max-defer alarm: if a digest stays
 #     undelivered past FM_MAX_DEFER_SECS, the daemon retries a normal flush and
 #     writes state/.subsuper-inject-wedged if submit still cannot be confirmed.
+#   - Idle non-terminal opencode crewmates are auto-nudged through the shared
+#     classifier before stale wakes escalate to firstmate, using the same
+#     FM_MAX_AUTO_NUDGES / FM_AUTO_NUDGE_INTERVAL_SECS knobs as the watcher.
 #   - Cheap heartbeat catch-all: every HEARTBEAT_SCAN_SECS the daemon greps all
 #     state/*.status for a captain-relevant line the per-wake classifier might
 #     have missed (e.g. a status verb outside CAPTAIN_RE) and escalates it.
@@ -81,6 +84,14 @@
 #                                   kinds.
 #          FM_STALE_ESCALATE_SECS   idle seconds before a stale pane escalates
 #                                   as a possible wedge (default 240)
+#          FM_MAX_AUTO_NUDGES       consecutive opencode nudges before the
+#                                   classifier escalates for inspection
+#                                   (default 3)
+#          FM_AUTO_NUDGE_INTERVAL_SECS
+#                                   minimum seconds between nudges for the same
+#                                   unchanged task-progress signature
+#                                   (default 60)
+#          FM_AUTO_NUDGE_MESSAGE    generic opencode continuation steer
 #          FM_ESCALATE_BATCH_SECS   buffer window for batched escalation
 #                                   digests; 0 = flush immediately (default 90)
 #          FM_HEARTBEAT_SCAN_SECS   cadence for the catch-all status scan
@@ -365,6 +376,15 @@ classify_signal() {  # <reason-after-colon> <state>
   # strip a trailing " | " separator so the distilled line is clean
   distilled="${distilled% | }"
   if [ -z "$rel" ]; then
+    local auto_decision auto_action auto_detail
+    # shellcheck disable=SC2086  # $reason is the space-separated signal file list from the watcher.
+    auto_decision=$(auto_nudge_signal_decision "$state" $reason)
+    auto_action=${auto_decision%%|*}
+    auto_detail=${auto_decision#*|}
+    case "$auto_action" in
+      self|safe) printf 'self|%s' "$auto_detail"; return ;;
+      escalate)  printf 'escalate|%s' "$auto_detail"; return ;;
+    esac
     printf 'self|routine signal: %s' "$distilled"
   elif [ "$all_seen" = "1" ]; then
     # Every relevant status was already escalated by the catch-all scan;
@@ -393,6 +413,14 @@ classify_stale() {  # <window> <state>
     printf 'escalate|stale + terminal status: %s' "$last"
     return
   fi
+  local auto_decision auto_action auto_detail
+  auto_decision=$(auto_nudge_stale_decision "$win" "$state")
+  auto_action=${auto_decision%%|*}
+  auto_detail=${auto_decision#*|}
+  case "$auto_action" in
+    self|safe) printf 'self|%s' "$auto_detail"; return ;;
+    escalate)  printf 'escalate|%s' "$auto_detail"; return ;;
+  esac
   # Non-terminal (or no status): defer to the persistence recheck. The caller
   # records/refreshes the stale marker so housekeeping can age it.
   printf 'self|transient stale (%s): %s' "$win" "${last:-no status}"
@@ -649,6 +677,19 @@ housekeeping() {  # <state>
     if [ -z "$win" ]; then
       # Window gone (task torn down): drop the marker, nothing to escalate.
       rm -f "$marker"; continue
+    fi
+    local auto_decision auto_action auto_detail
+    auto_decision=$(auto_nudge_stale_decision "$win" "$state")
+    auto_action=${auto_decision%%|*}
+    auto_detail=${auto_decision#*|}
+    if [ "$auto_action" = self ] || [ "$auto_action" = safe ]; then
+      log "self-handle stale marker: $win -> $auto_detail"
+      continue
+    fi
+    if [ "$auto_action" = escalate ]; then
+      escalate_add "$state" "$auto_detail"
+      stale_marker_remove "$win" "$state"
+      continue
     fi
     stale_window_is_busy "$win" "$state"
     case "$?" in

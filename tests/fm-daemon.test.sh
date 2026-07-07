@@ -73,6 +73,37 @@ test_classify_check_and_unknown_escalate() {
   pass "check + unknown escalate; heartbeat self-handles"
 }
 
+test_classify_auto_nudges_idle_opencode_in_away_mode() {
+  local dir state fakebin sent out win key
+  dir=$(make_supercase auto-nudge-away)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  sent="$dir/send.log"
+  make_fake_crew_state "$fakebin" >/dev/null
+  install_fake_fm_send "$fakebin" "$sent"
+  export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake idle'
+
+  fm_write_meta "$state/sig.meta" "window=sess:fm-sig" "kind=ship" "harness=opencode"
+  : > "$state/sig.turn-ended"
+  out=$(FM_STATE_OVERRIDE="$state" FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent" \
+    FM_AUTO_NUDGE_INTERVAL_SECS=999 classify_signal "$state/sig.turn-ended" "$state")
+  case "$out" in self\|auto-nudge*) ;; *) fail "away-mode signal did not self-handle by auto-nudging: $out" ;; esac
+
+  win="sess:fm-stale"
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  fm_write_meta "$state/stale.meta" "window=$win" "kind=ship" "harness=opencode"
+  printf 'working: implementing\n' > "$state/stale.status"
+  printf 'pane-hash\n' > "$state/.hash-$key"
+  out=$(FM_STATE_OVERRIDE="$state" FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent" \
+    FM_AUTO_NUDGE_INTERVAL_SECS=999 classify_stale "$win" "$state")
+  case "$out" in self\|auto-nudged*) ;; *) fail "away-mode stale did not self-handle by auto-nudging: $out" ;; esac
+
+  [ "$(line_count "$sent")" = 2 ] || fail "away-mode auto nudge did not send exactly two test nudges: $(cat "$sent")"
+  unset FM_CREW_STATE_BIN FM_FAKE_CREW_STATE
+  pass "away-mode classifiers auto-nudge idle non-terminal opencode signal and stale wakes"
+}
+
 test_stale_transient_self_records_marker() {
   local dir state out key
   dir=$(make_supercase stale-transient)
@@ -972,6 +1003,7 @@ test_daemon_state_root_uses_fm_home
 test_classify_routine_signal_self
 test_classify_terminal_signal_escalates
 test_classify_check_and_unknown_escalate
+test_classify_auto_nudges_idle_opencode_in_away_mode
 test_stale_transient_self_records_marker
 test_stale_terminal_escalates
 test_housekeeping_persistent_stale_escalates

@@ -193,6 +193,136 @@ test_signal_crew_provably_working_classifier() {
   pass "signal_crew_provably_working: benign only when every referenced crew is provably working"
 }
 
+test_auto_nudge_idle_opencode_signal_absorbed_once() {
+  local dir state fakebin out sent pid
+  dir=$(make_case auto-nudge-signal); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"; sent="$dir/send.log"
+  install_fake_fm_send "$fakebin" "$sent"
+  fm_write_meta "$state/task.meta" "window=test:fm-task" "kind=ship" "harness=opencode"
+  : > "$state/task.turn-ended"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake idle'
+
+  watch_bg "$state" "$fakebin" "$out" env FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent" FM_AUTO_NUDGE_INTERVAL_SECS=999
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher exited instead of auto-nudging an idle opencode turn-end: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || { reap "$pid"; fail "auto-nudged signal printed a wake reason: $(cat "$out")"; }
+  [ ! -s "$state/.wake-queue" ] || { reap "$pid"; fail "auto-nudged signal enqueued a wake"; }
+  wait_line_count "$sent" 1 50 || { reap "$pid"; fail "idle opencode signal was not nudged exactly once: $(cat "$sent")"; }
+  grep -F "fm-task" "$sent" >/dev/null || { reap "$pid"; fail "auto nudge did not target the task via fm-send: $(cat "$sent")"; }
+  [ -s "$state/.seen-task_turn-ended" ] || { reap "$pid"; fail "auto-nudged turn-end did not advance its .seen marker"; }
+  reap "$pid"
+  unset FM_FAKE_CREW_STATE
+  pass "an idle non-terminal opencode turn-end is auto-nudged once and absorbed"
+}
+
+test_auto_nudge_never_for_busy_terminal_or_secondmate() {
+  local dir state fakebin out sent pid drain_out sig
+  dir=$(make_case auto-nudge-never); state="$dir/state"; fakebin="$dir/fakebin"; out="$dir/watch.out"; sent="$dir/send.log"; drain_out="$dir/drain.out"
+  install_fake_fm_send "$fakebin" "$sent"
+
+  fm_write_meta "$state/busy.meta" "window=test:fm-busy" "kind=ship" "harness=opencode"
+  : > "$state/busy.turn-ended"
+  export FM_FAKE_CREW_STATE='state: working · source: pane · esc interrupt'
+  watch_bg "$state" "$fakebin" "$out" env FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent"
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "busy opencode signal surfaced instead of being treated as provably working: $(cat "$out")"
+  fi
+  reap "$pid"
+
+  fm_write_meta "$state/term.meta" "window=test:fm-term" "kind=ship" "harness=opencode"
+  printf 'needs-decision: pick a path\n' > "$state/term.status"
+  : > "$out"
+  watch_bg "$state" "$fakebin" "$out" env FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent"
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "terminal opencode status did not surface"
+  grep -F "signal: $state/term.status" "$out" >/dev/null || fail "terminal opencode status surfaced with the wrong reason: $(cat "$out")"
+
+  fm_write_meta "$state/second.meta" "window=test:fm-second" "kind=secondmate" "harness=opencode"
+  : > "$state/second.turn-ended"
+  sig=$(seen_sig "$state/term.status"); printf '%s' "$sig" > "$state/.seen-term_status"
+  : > "$out"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake idle'
+  watch_bg "$state" "$fakebin" "$out" env FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent"
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "secondmate turn-end did not surface through the existing path"
+  grep -F "signal: $state/second.turn-ended" "$out" >/dev/null || fail "secondmate turn-end surfaced with the wrong reason: $(cat "$out")"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after no-nudge matrix failed"
+  [ ! -s "$sent" ] || fail "auto nudge fired for a busy, terminal, or secondmate case: $(cat "$sent")"
+  unset FM_FAKE_CREW_STATE
+  pass "auto nudge never fires for busy, terminal, or secondmate wakes"
+}
+
+test_auto_nudge_counter_giveup_and_progress_reset() {
+  local dir state fakebin sent window key decision
+  dir=$(make_case auto-nudge-counter); state="$dir/state"; fakebin="$dir/fakebin"; sent="$dir/send.log"
+  install_fake_fm_send "$fakebin" "$sent"
+  window="test:fm-loop"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  fm_write_meta "$state/loop.meta" "window=$window" "kind=ship" "harness=opencode"
+  printf 'working: implementing\n' > "$state/loop.status"
+  printf 'hash-a\n' > "$state/.hash-$key"
+  export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake idle'
+
+  decision=$(FM_STATE_OVERRIDE="$state" FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent" \
+    FM_MAX_AUTO_NUDGES=2 FM_AUTO_NUDGE_INTERVAL_SECS=0 auto_nudge_stale_decision "$window" "$state")
+  case "$decision" in self\|auto-nudged*) ;; *) fail "first idle detection did not auto-nudge: $decision" ;; esac
+  decision=$(FM_STATE_OVERRIDE="$state" FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent" \
+    FM_MAX_AUTO_NUDGES=2 FM_AUTO_NUDGE_INTERVAL_SECS=0 auto_nudge_stale_decision "$window" "$state")
+  case "$decision" in self\|auto-nudged*) ;; *) fail "second idle detection did not auto-nudge: $decision" ;; esac
+  decision=$(FM_STATE_OVERRIDE="$state" FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent" \
+    FM_MAX_AUTO_NUDGES=2 FM_AUTO_NUDGE_INTERVAL_SECS=0 auto_nudge_stale_decision "$window" "$state")
+  case "$decision" in escalate\|*demand-inspection*) ;; *) fail "third no-progress detection did not give up and escalate: $decision" ;; esac
+  [ "$(line_count "$sent")" = 2 ] || fail "give-up path sent the wrong number of nudges before escalating: $(cat "$sent")"
+
+  printf 'hash-b\n' > "$state/.hash-$key"
+  decision=$(FM_STATE_OVERRIDE="$state" FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent" \
+    FM_MAX_AUTO_NUDGES=2 FM_AUTO_NUDGE_INTERVAL_SECS=0 auto_nudge_stale_decision "$window" "$state")
+  case "$decision" in self\|auto-nudged*) ;; *) fail "pane progress did not reset the auto-nudge counter: $decision" ;; esac
+  [ "$(cat "$state/.auto-nudges-loop" 2>/dev/null || echo 0)" = 1 ] || fail "auto-nudge counter was not reset after progress"
+  [ "$(line_count "$sent")" = 3 ] || fail "progress reset did not allow a fresh nudge: $(cat "$sent")"
+  unset FM_CREW_STATE_BIN FM_FAKE_CREW_STATE
+  pass "auto-nudge counter gives up after the configured limit and resets on pane progress"
+}
+
+test_auto_nudge_signal_stale_oscillation_holds_bounds() {
+  local dir state fakebin sent window key decision
+  dir=$(make_case auto-nudge-oscillation); state="$dir/state"; fakebin="$dir/fakebin"; sent="$dir/send.log"
+  install_fake_fm_send "$fakebin" "$sent"
+  window="test:fm-osc"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  fm_write_meta "$state/osc.meta" "window=$window" "kind=ship" "harness=opencode"
+  printf 'working: implementing\n' > "$state/osc.status"
+  printf 'frozen-pane\n' > "$state/.hash-$key"
+  : > "$state/osc.turn-ended"
+  export FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh"
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · fake idle'
+
+  # Alternate the two wake paths on an otherwise UNCHANGED task (same status stat,
+  # same pane hash). The give-up counter must climb monotonically across the
+  # signal<->stale switches and never reset, so exactly FM_MAX_AUTO_NUDGES nudges
+  # go out before escalation - the oscillation-reset regression would leak extra
+  # nudges and never converge.
+  decision=$(FM_STATE_OVERRIDE="$state" FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent" \
+    FM_MAX_AUTO_NUDGES=2 FM_AUTO_NUDGE_INTERVAL_SECS=0 auto_nudge_signal_decision "$state" "$state/osc.turn-ended")
+  case "$decision" in self\|*) ;; *) fail "signal wake did not auto-nudge on first sight: $decision" ;; esac
+  [ "$(cat "$state/.auto-nudges-osc" 2>/dev/null)" = 1 ] || fail "counter not 1 after first (signal) nudge: $(cat "$state/.auto-nudges-osc" 2>/dev/null)"
+
+  decision=$(FM_STATE_OVERRIDE="$state" FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent" \
+    FM_MAX_AUTO_NUDGES=2 FM_AUTO_NUDGE_INTERVAL_SECS=0 auto_nudge_stale_decision "$window" "$state")
+  case "$decision" in self\|auto-nudged*) ;; *) fail "stale wake reset the counter or did not nudge after a signal nudge: $decision" ;; esac
+  [ "$(cat "$state/.auto-nudges-osc" 2>/dev/null)" = 2 ] || fail "oscillation reset the counter instead of climbing to 2: $(cat "$state/.auto-nudges-osc" 2>/dev/null)"
+
+  decision=$(FM_STATE_OVERRIDE="$state" FM_SEND_BIN="$fakebin/fm-send.sh" FM_FAKE_SEND_LOG="$sent" \
+    FM_MAX_AUTO_NUDGES=2 FM_AUTO_NUDGE_INTERVAL_SECS=0 auto_nudge_signal_decision "$state" "$state/osc.turn-ended")
+  case "$decision" in escalate\|*demand-inspection*) ;; *) fail "counter did not give up and escalate after the bound across wake types: $decision" ;; esac
+  [ "$(line_count "$sent")" = 2 ] || fail "oscillation leaked extra nudges past FM_MAX_AUTO_NUDGES: $(cat "$sent")"
+  unset FM_CREW_STATE_BIN FM_FAKE_CREW_STATE
+  pass "auto-nudge bounds hold across signal<->stale oscillation (no counter reset on wake-type switch)"
+}
+
 # --- benign wakes are absorbed ONLY when the crew is provably working ---------
 
 test_provably_working_signal_absorbed() {
@@ -746,6 +876,10 @@ test_scan_captain_relevant_statuses_classifier
 test_classifier_primitives
 test_crew_is_provably_working_classifier
 test_signal_crew_provably_working_classifier
+test_auto_nudge_idle_opencode_signal_absorbed_once
+test_auto_nudge_never_for_busy_terminal_or_secondmate
+test_auto_nudge_counter_giveup_and_progress_reset
+test_auto_nudge_signal_stale_oscillation_holds_bounds
 test_provably_working_signal_absorbed
 test_turn_ended_provably_working_absorbed
 test_turn_ended_not_working_surfaced

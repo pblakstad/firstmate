@@ -26,6 +26,9 @@
 #                          wake payload itself, not just repetition, forces a
 #                          closer look instead of another routine re-arm. Unless
 #                          afk is active.
+#                          Idle non-terminal opencode crewmates are first
+#                          auto-nudged by fm-classify-lib.sh, bounded by
+#                          FM_MAX_AUTO_NUDGES and FM_AUTO_NUDGE_INTERVAL_SECS.
 #   check: <script>: <out> per-task check output, always actionable
 #   heartbeat              fleet-scan backstop found an unsurfaced captain-relevant
 #                          status, unless afk is active
@@ -448,8 +451,27 @@ EOF
     # will not re-fire, log, and keep blocking without enqueuing. The provably-working
     # check is the only costly one (it may run a bounded no-mistakes call), so the ||
     # ordering evaluates it ONLY for a non-afk, no-captain-verb signal.
+    auto_decision="none|not checked"
     # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
-    if afk_present || signal_reason_is_actionable $files || ! signal_crew_provably_working $files; then
+    if ! afk_present && ! signal_reason_is_actionable $files; then
+      # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
+      auto_decision=$(auto_nudge_signal_decision "$STATE" $files)
+    fi
+    auto_action=${auto_decision%%|*}
+    auto_detail=${auto_decision#*|}
+    # shellcheck disable=SC2086  # $files is a space-separated status-path list (ids carry no spaces)
+    if [ "$auto_action" = self ] || [ "$auto_action" = safe ]; then
+      while IFS=$(printf '\t') read -r sf sig f; do
+        [ -n "$sf" ] || continue
+        printf '%s' "$sig" > "$sf"
+      done <<EOF
+$pending
+EOF
+      triage_log "absorbed $reason ($auto_detail)"
+    elif afk_present || signal_reason_is_actionable $files || [ "$auto_action" = escalate ] || ! signal_crew_provably_working $files; then
+      if [ "$auto_action" = escalate ]; then
+        reason="$reason ($auto_detail)"
+      fi
       while IFS=$(printf '\t') read -r sf sig f; do
         [ -n "$sf" ] || continue
         fm_wake_append signal "$(basename "$f")" "$reason" || exit 1
@@ -564,13 +586,40 @@ EOF
               date +%s > "$ssf"
               triage_log "absorbed non-terminal stale (provably working): $w"
             else
-              fm_wake_append stale "$w" "stale: $w" || exit 1
-              printf '%s' "$h" > "$sf"
-              rm -f "$ssf"
-              wake "stale: $w"
+              auto_decision=$(auto_nudge_stale_decision "$w" "$STATE")
+              auto_action=${auto_decision%%|*}
+              auto_detail=${auto_decision#*|}
+              if [ "$auto_action" = self ]; then
+                printf '%s' "$h" > "$sf"
+                rm -f "$ssf"
+                triage_log "absorbed non-terminal stale ($auto_detail): $w"
+              elif [ "$auto_action" = escalate ]; then
+                reason="stale: $w ($auto_detail)"
+                fm_wake_append stale "$w" "$reason" || exit 1
+                printf '%s' "$h" > "$sf"
+                rm -f "$ssf"
+                wake "$reason"
+              else
+                fm_wake_append stale "$w" "stale: $w" || exit 1
+                printf '%s' "$h" > "$sf"
+                rm -f "$ssf"
+                wake "stale: $w"
+              fi
             fi
           else
-            wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf"
+            auto_decision=$(auto_nudge_stale_decision "$w" "$STATE")
+            auto_action=${auto_decision%%|*}
+            auto_detail=${auto_decision#*|}
+            if [ "$auto_action" = self ]; then
+              triage_log "absorbed repeated non-terminal stale ($auto_detail): $w"
+            elif [ "$auto_action" = escalate ]; then
+              reason="stale: $w ($auto_detail)"
+              fm_wake_append stale "$w" "$reason" || exit 1
+              rm -f "$ssf"
+              wake "$reason"
+            else
+              wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf"
+            fi
           fi
         fi
       else

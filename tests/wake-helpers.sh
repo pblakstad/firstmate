@@ -83,6 +83,29 @@ SH
   printf '%s\n' "$fakebin/fm-crew-state.sh"
 }
 
+install_fake_fm_send() {  # <fakebin> <sent-file>
+  local fakebin=$1 sent=$2
+  cat > "$fakebin/fm-send.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+printf '%s\n' "$*" >> "${FM_FAKE_SEND_LOG:?FM_FAKE_SEND_LOG unset}"
+SH
+  chmod +x "$fakebin/fm-send.sh"
+  : > "$sent"
+}
+
+line_count() { awk 'END { print NR + 0 }' "$1"; }
+
+wait_line_count() {  # <file> <expected> [limit-ticks]
+  local file=$1 expected=$2 limit=${3:-30} i=0
+  while [ "$i" -lt "$limit" ]; do
+    [ "$(line_count "$file")" = "$expected" ] && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
 make_supercase() {
   local name=$1 dir fakebin
   dir="$TMP_ROOT/$name"

@@ -40,7 +40,7 @@ If you have changed away from the firstmate home in an interactive shell, invoke
 | `fm-tasks-axi-lib.sh`    | Shared backlog-backend selector and `tasks-axi` compatibility probe sourced by bootstrap and teardown              |
 | `fm-wake-drain.sh`       | Atomically drain queued watcher wakes before handling supervision work, then run the watcher-liveness guard         |
 | `fm-wake-lib.sh`         | Shared durable wake queue, portable lock helpers, path-age helpers, and watcher identity/health helpers sourced by the watcher, drain, arm, guard, turn-end guard, daemon, and teardown |
-| `fm-classify-lib.sh`     | Shared captain-relevant wake classifier sourced by the watcher and daemon, plus the watcher's provably-working predicate |
+| `fm-classify-lib.sh`     | Shared captain-relevant wake classifier sourced by the watcher and daemon, plus the watcher's provably-working predicate and the opencode auto-nudge watchdog |
 | `fm-send.sh`             | Send one verified literal line or backend-supported `--key` through the target's recorded runtime backend; exits non-zero on confirmed swallowed Enter; bare `kind=secondmate` targets are marked as from-firstmate; slash commands and codex `$...` skill invocations get popup-settle before backend-specific submit verification; text sends pause `FM_SEND_SETTLE` seconds after success |
 | `fm-tmux-lib.sh`         | Shared tmux pane primitives for busy detection, dim-ghost-aware and border-aware composer detection, and verified submit retry |
 | `fm-peek.sh`             | Print a bounded tail of a crewmate endpoint through the target's recorded runtime backend                            |
