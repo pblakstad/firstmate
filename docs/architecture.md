@@ -35,8 +35,9 @@ On the `claude` harness, a tracked project Stop hook (`bin/fm-turnend-guard.sh`)
 The hook is scoped out of secondmate homes and crewmate/scout worktrees, allows Claude's own `stop_hook_active` retry, and is documented in [turnend-guard.md](turnend-guard.md).
 
 A presence-gated sub-supervisor (`bin/fm-supervise-daemon.sh`) extends this for walk-away supervision: the `/afk` skill activates it, after which the watcher reverts to daemon-managed one-shot mode and the daemon self-handles routine wakes in bash.
-The watcher and daemon share `bin/fm-classify-lib.sh` for captain-relevant status verbs and status-scan primitives.
+The watcher and daemon share `bin/fm-classify-lib.sh` for captain-relevant status verbs, status-scan primitives, and the opencode auto-nudge watchdog.
 The always-on watcher also uses that library's provably-working predicate on no-verb signals and first-sighting stale panes before status-log terminality is trusted, while the daemon keeps its away-mode stale recheck unchanged.
+Before an idle non-terminal opencode crewmate's no-verb signal or stale pane escalates, that shared watchdog sends the crew a generic continuation steer through `fm-send.sh`, bounded by `FM_MAX_AUTO_NUDGES` consecutive nudges and `FM_AUTO_NUDGE_INTERVAL_SECS` between nudges for the same unchanged task-progress signature; once genuine progress appears the counter resets, and after the nudge budget is spent with no progress the watchdog escalates for inspection instead of nudging again.
 The daemon escalates only captain-relevant events as one batched, single-line digest (prefixed with an in-band sentinel marker so firstmate can tell daemon injections apart from real messages).
 Its supervisor injection path supports tmux and herdr panes, with `FM_SUPERVISOR_BACKEND` and `FM_SUPERVISOR_TARGET` resolved independently from the task-spawn backend.
 Pane existence, busy checks, composer checks, capture, and verified submit route through `bin/fm-backend.sh`: tmux keeps the same submit core used by the tmux send backend, while herdr reuses its native busy state and structural composer classifier.
